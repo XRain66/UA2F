@@ -1,0 +1,277 @@
+name: 构建AArch64静态链接UA2F
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        submodules: 'recursive'
+
+    - name: 安装交叉编译工具链
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+        sudo apt-get install -y build-essential cmake pkg-config
+
+    - name: 安装依赖库
+      run: |
+        # 安装开发包
+        sudo apt-get install -y libmnl-dev libnetfilter-queue-dev libnfnetlink-dev
+        
+        # 为AArch64架构编译静态库
+        mkdir -p deps/build
+        
+        # 编译libmnl
+        cd deps
+        wget https://netfilter.org/projects/libmnl/files/libmnl-1.0.5.tar.bz2
+        tar -xf libmnl-1.0.5.tar.bz2
+        cd libmnl-1.0.5
+        ./configure --host=aarch64-linux-gnu --prefix=$(pwd)/../build --disable-shared --enable-static
+        make -j$(nproc)
+        make install
+        cd ..
+        
+        # 编译libnfnetlink
+        wget https://netfilter.org/projects/libnfnetlink/files/libnfnetlink-1.0.2.tar.bz2
+        tar -xf libnfnetlink-1.0.2.tar.bz2
+        cd libnfnetlink-1.0.2
+        ./configure --host=aarch64-linux-gnu --prefix=$(pwd)/../build --disable-shared --enable-static
+        make -j$(nproc)
+        make install
+        cd ..
+        
+        # 编译libnetfilter_queue
+        wget https://netfilter.org/projects/libnetfilter_queue/files/libnetfilter_queue-1.0.5.tar.bz2
+        tar -xf libnetfilter_queue-1.0.5.tar.bz2
+        cd libnetfilter_queue-1.0.5
+        PKG_CONFIG_PATH=$(pwd)/../build/lib/pkgconfig ./configure --host=aarch64-linux-gnu --prefix=$(pwd)/../build --disable-shared --enable-static
+        make -j$(nproc)
+        make install
+        cd ..
+        
+        # 显示编译的库文件
+        echo "\n\n编译的静态库文件："
+        find build -name "*.a"
+        cd ..
+
+    - name: 创建构建目录
+      run: mkdir -p build_static
+
+    - name: 查看CMakeLists.txt
+      run: |
+        echo "CMakeLists.txt内容："
+        cat CMakeLists.txt
+
+    - name: 获取Git信息
+      id: git-info
+      run: |
+        echo "获取Git信息"
+        GIT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "unknown")
+        GIT_BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
+        GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+        GIT_DIRTY=$(git status --porcelain 2>/dev/null | wc -l)
+        if [ "$GIT_DIRTY" -eq "0" ]; then
+          GIT_DIRTY="clean"
+        else
+          GIT_DIRTY="dirty"
+        fi
+        
+        echo "GIT_TAG=$GIT_TAG"
+        echo "GIT_BRANCH=$GIT_BRANCH"
+        echo "GIT_COMMIT=$GIT_COMMIT"
+        echo "GIT_DIRTY=$GIT_DIRTY"
+        
+        echo "git_tag=$GIT_TAG" >> $GITHUB_OUTPUT
+        echo "git_branch=$GIT_BRANCH" >> $GITHUB_OUTPUT
+        echo "git_commit=$GIT_COMMIT" >> $GITHUB_OUTPUT
+        echo "git_dirty=$GIT_DIRTY" >> $GITHUB_OUTPUT
+
+    - name: 源码预检查
+      run: |
+        echo "执行源码预检查，确保编译前发现潜在问题"
+        
+        # 检查必要的源文件是否存在
+        for file in src/ua2f.c src/statistics.c src/util.c src/cache.c src/handler.c src/cli.c src/config.c src/third/nfqueue-mnl/nfqueue-mnl.c; do
+          if [ ! -f "$file" ]; then
+            echo "错误: 找不到源文件 $file"
+            exit 1
+          fi
+        done
+        echo "✓ 所有必要的源文件都存在"
+        
+        # 检查custom.h.in文件是否存在
+        if [ ! -f "src/custom.h.in" ]; then
+          echo "错误: 找不到 src/custom.h.in 文件"
+          exit 1
+        fi
+        echo "✓ custom.h.in 文件存在"
+        
+        # 检查config.c文件中的UCI依赖
+        if grep -q "include <uci.h>" src/config.c && ! grep -q "#ifdef UA2F_ENABLE_UCI" src/config.c; then
+          echo "警告: config.c 文件中包含 uci.h 但没有条件编译保护"
+          echo "将添加条件编译保护"
+        else
+          echo "✓ config.c 文件中的 UCI 依赖已正确处理"
+        fi
+        
+        # 检查backtrace.h文件中的问题
+        if [ -f "src/backtrace.h" ]; then
+          if grep -q "backtrace_create_state" src/backtrace.h && ! grep -q "#include <backtrace.h>" src/backtrace.h; then
+            echo "警告: backtrace.h 文件中使用了 backtrace_create_state 但没有包含 backtrace.h"
+            echo "将禁用 backtrace 功能"
+          fi
+          
+          # 检查转义字符问题
+          if grep -q "\\\\\\" src/backtrace.h; then
+            echo "警告: backtrace.h 文件中存在错误的转义字符 (\\\\)"
+            echo "将修复转义字符问题"
+          fi
+        else
+          echo "警告: 找不到 src/backtrace.h 文件，将创建一个简化版本"
+        fi
+        
+        # 检查assert函数的使用
+        for file in src/ua2f.c src/handler.c; do
+          if grep -q "assert(" $file && ! grep -q "#include <assert.h>" $file; then
+            echo "警告: $file 文件中使用了 assert 函数但没有包含 assert.h"
+            echo "将添加 assert.h 包含"
+          fi
+        done
+        
+        # 检查依赖库是否已安装
+        echo "检查依赖库..."
+        mkdir -p deps/build/lib
+        if [ ! -f "deps/build/lib/libmnl.a" ] || [ ! -f "deps/build/lib/libnetfilter_queue.a" ] || [ ! -f "deps/build/lib/libnfnetlink.a" ]; then
+          echo "注意: 依赖库尚未安装，将在后续步骤中安装"
+        else
+          echo "✓ 依赖库已安装"
+        fi
+        
+        echo "源码预检查完成"
+
+    - name: 修复源代码中的头文件包含
+      run: |
+        echo "修复源代码中的头文件包含"
+        
+        # 添加assert.h到ua2f.c
+        echo "确保ua2f.c文件中包含assert.h"
+        sed -i '1s/^/#include <assert.h>\n/' src/ua2f.c
+        
+        # 检查ua2f.c文件中是否已经包含了assert.h
+        echo "检查ua2f.c文件中是否已经包含了assert.h："
+        grep -n "#include <assert.h>" src/ua2f.c || echo "未找到assert.h包含"
+        
+        # 显示ua2f.c文件的前20行
+        echo "ua2f.c文件的前20行："
+        head -n 20 src/ua2f.c
+        
+        # 添加assert.h到handler.c
+        echo "确保handler.c文件中包含assert.h"
+        sed -i '1s/^/#include <assert.h>\n/' src/handler.c
+        
+        # 检查handler.c文件中是否已经包含了assert.h
+        echo "检查handler.c文件中是否已经包含了assert.h："
+        grep -n "#include <assert.h>" src/handler.c || echo "未找到assert.h包含"
+        
+        # 禁用backtrace功能
+        echo "禁用backtrace功能"
+        echo '#ifndef UA2F_BACKTRACE_H' > src/backtrace.h
+        echo '#define UA2F_BACKTRACE_H' >> src/backtrace.h
+        echo '' >> src/backtrace.h
+        echo '#define UA2F_ENABLE_BACKTRACE 0' >> src/backtrace.h
+        echo '' >> src/backtrace.h
+        echo '#define UA2F_INIT_BACKTRACE() do { \' >> src/backtrace.h
+        echo '    fprintf(stderr, "Backtrace support is disabled\\n"); \' >> src/backtrace.h
+        echo '} while(0)' >> src/backtrace.h
+        echo '' >> src/backtrace.h
+        echo '#endif // UA2F_BACKTRACE_H' >> src/backtrace.h
+        echo "已替换backtrace.h文件"
+        
+        # 修改config.c，确保在禁用UCI时不会包含uci.h
+        echo "修改config.c，确保在禁用UCI时不会包含uci.h"
+        sed -i '1s/^/#ifndef UA2F_ENABLE_UCI\n#define UA2F_ENABLE_UCI OFF\n#endif\n/' src/config.c
+        
+        # 检查修改后的文件
+        echo "修改后的config.c文件头部："
+        head -n 10 src/config.c
+
+    - name: 手动编译和链接
+      run: |
+        echo "\n\n开始手动编译和链接："
+        
+        # 创建临时目录用于编译
+        mkdir -p build_static/obj
+        
+        # 生成custom.h文件
+        echo "生成custom.h文件"
+        sed 's/@UA2F_USE_CUSTOM_UA@/0/g' src/custom.h.in > build_static/custom.h
+        
+        # 获取Git信息
+        GIT_TAG="${{ steps.git-info.outputs.git_tag }}"
+        GIT_BRANCH="${{ steps.git-info.outputs.git_branch }}"
+        GIT_COMMIT="${{ steps.git-info.outputs.git_commit }}"
+        GIT_DIRTY="${{ steps.git-info.outputs.git_dirty }}"
+        
+        # 测试编译第一个源文件，检查是否有编译错误
+        echo "测试编译 src/ua2f.c，检查是否有编译错误..."
+        aarch64-linux-gnu-gcc -c -o /tmp/test.o \
+          -I. -Ibuild_static -Isrc -Ideps/build/include \
+          -DUA2F_ENABLE_UCI=OFF \
+          -DUA2F_GIT_TAG=\"$GIT_TAG\" \
+          -DUA2F_GIT_BRANCH=\"$GIT_BRANCH\" \
+          -DUA2F_GIT_COMMIT=\"$GIT_COMMIT\" \
+          -DUA2F_GIT_DIRTY=\"$GIT_DIRTY\" \
+          -DUA2F_VERSION=\"static-aarch64\" \
+          -O3 -DNDEBUG src/ua2f.c
+        
+        if [ $? -ne 0 ]; then
+          echo "错误: 测试编译失败，请检查上述错误信息"
+          exit 1
+        else
+          echo "✓ 测试编译成功，继续编译所有源文件"
+        fi
+        
+        # 编译所有源文件
+        echo "编译所有源文件"
+        for src in src/ua2f.c src/statistics.c src/util.c src/cache.c src/handler.c src/cli.c src/config.c src/third/nfqueue-mnl/nfqueue-mnl.c; do
+          echo "编译 $src"
+          aarch64-linux-gnu-gcc -c -o build_static/obj/$(basename $src .c).o \
+            -I. -Ibuild_static -Isrc -Ideps/build/include \
+            -DUA2F_ENABLE_UCI=OFF \
+            -DUA2F_GIT_TAG=\"$GIT_TAG\" \
+            -DUA2F_GIT_BRANCH=\"$GIT_BRANCH\" \
+            -DUA2F_GIT_COMMIT=\"$GIT_COMMIT\" \
+            -DUA2F_GIT_DIRTY=\"$GIT_DIRTY\" \
+            -DUA2F_VERSION=\"static-aarch64\" \
+            -O3 -DNDEBUG $src
+        done
+        
+        # 链接所有目标文件
+        echo "链接所有目标文件"
+        aarch64-linux-gnu-gcc -static -o build_static/ua2f-static-aarch64 \
+          build_static/obj/*.o \
+          -Ldeps/build/lib \
+          -lmnl -lnetfilter_queue -lnfnetlink -lpthread
+
+    - name: 检查生成的可执行文件
+      run: |
+        file build_static/ua2f-static-aarch64 || echo "文件不存在"
+        ls -la build_static/ua2f-static-aarch64 || echo "文件不存在"
+
+    - name: 上传构建产物
+      uses: actions/upload-artifact@v4
+      with:
+        name: ua2f-static-aarch64
+        path: build_static/ua2f-static-aarch64
+        if-no-files-found: error

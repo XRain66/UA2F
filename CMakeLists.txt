@@ -3,6 +3,10 @@ project(UA2F LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 17)
 
+# 添加静态链接选项
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+message(STATUS "Static linking is enabled.")
+
 OPTION(UA2F_BUILD_TESTS "Build tests" OFF)
 OPTION(UA2F_ENABLE_UCI "Enable UCI support" ON)
 OPTION(UA2F_NO_CACHE "Disable cache" OFF)
@@ -104,7 +108,7 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/custom.h.in ${CMAKE_CURRENT_BINAR
 
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
-add_executable(ua2f
+add_executable(ua2f_static
         src/ua2f.c
         src/statistics.c
         src/util.c
@@ -114,7 +118,8 @@ add_executable(ua2f
         src/config.c
         src/third/nfqueue-mnl/nfqueue-mnl.c)
 
-target_link_libraries(ua2f mnl netfilter_queue pthread nfnetlink)
+# 静态链接所有依赖库
+target_link_libraries(ua2f_static -static mnl netfilter_queue pthread nfnetlink)
 
 if (UA2F_ENABLE_BACKTRACE)
     set(LIBBACKTRACE_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/libbacktrace)
@@ -133,19 +138,19 @@ if (UA2F_ENABLE_BACKTRACE)
     add_custom_target(libbacktrace
         COMMAND cd ${CMAKE_CURRENT_SOURCE_DIR}/src/third/libbacktrace && 
                 autoreconf -i && 
-                ./configure --prefix=${LIBBACKTRACE_BUILD_DIR} --host=${LIBBACKTRACE_HOST} && 
+                ./configure --prefix=${LIBBACKTRACE_BUILD_DIR} --host=${LIBBACKTRACE_HOST} --enable-static --disable-shared && 
                 make && 
                 make install
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/third/libbacktrace
     )
     
-    target_include_directories(ua2f PRIVATE ${LIBBACKTRACE_BUILD_DIR}/include)
+    target_include_directories(ua2f_static PRIVATE ${LIBBACKTRACE_BUILD_DIR}/include)
     
-    target_link_directories(ua2f PRIVATE ${LIBBACKTRACE_BUILD_DIR}/lib)
+    target_link_directories(ua2f_static PRIVATE ${LIBBACKTRACE_BUILD_DIR}/lib)
     
-    target_link_libraries(ua2f backtrace)
+    target_link_libraries(ua2f_static -static backtrace)
     
-    add_dependencies(ua2f libbacktrace)
+    add_dependencies(ua2f_static libbacktrace)
     
     add_compile_definitions(UA2F_ENABLE_BACKTRACE=1)
     message(STATUS "libbacktrace support is enabled.")
@@ -155,7 +160,7 @@ endif()
 
 if (UA2F_ENABLE_UCI)
     add_compile_definitions(UA2F_ENABLE_UCI=1)
-    target_link_libraries(ua2f uci)
+    target_link_libraries(ua2f_static -static uci)
 else ()
     message(STATUS "UCI support is disabled.")
 endif ()
@@ -167,7 +172,7 @@ else ()
     message(STATUS "Cache is auto.")
 endif ()
 
-install(TARGETS ua2f RUNTIME DESTINATION bin)
+install(TARGETS ua2f_static RUNTIME DESTINATION bin)
 
 if (UA2F_BUILD_TESTS)
     set(CMAKE_CXX_STANDARD 14)
